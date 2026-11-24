@@ -1,0 +1,242 @@
+Question 10: Parcel Courier Delivery and COD Collections (PostgreSQL)
+
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE couriers (
+    courier_id   SERIAL PRIMARY KEY,
+    courier_name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE parcels (
+    parcel_id    SERIAL PRIMARY KEY,
+    courier_id   INTEGER NOT NULL REFERENCES couriers(courier_id),
+    tracking_no  VARCHAR(30) NOT NULL UNIQUE,
+    cod_amount   NUMERIC(10, 2) NOT NULL CHECK (cod_amount >= 0),
+    status       VARCHAR(20) NOT NULL DEFAULT 'IN_TRANSIT'
+                 CHECK (status IN ('IN_TRANSIT', 'DELIVERED', 'RETURNED')),
+    delivered_on DATE NULL
+);
+
+CREATE TABLE cod_collections (
+    collection_id SERIAL PRIMARY KEY,
+    parcel_id     INTEGER NOT NULL UNIQUE REFERENCES parcels(parcel_id),
+    amount        NUMERIC(10, 2) NOT NULL CHECK (amount > 0),
+    collected_on  DATE NOT NULL DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE daily_cod (
+    cod_date        DATE PRIMARY KEY,
+    parcel_count    INTEGER NOT NULL DEFAULT 0,
+    total_collected NUMERIC(12, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed three couriers
+INSERT INTO couriers (courier_name) VALUES
+('Chanda Mulenga'),
+('Bwalya Phiri'),
+('Mutale Banda');
+
+-- Seed six parcels across mixed statuses and COD amounts (including zero COD):
+-- Parcels 1-3: IN_TRANSIT (with positive COD and zero COD)
+-- Parcels 4-5: DELIVERED (already delivered with COD collected)
+-- Parcel 6:    RETURNED
+INSERT INTO parcels (courier_id, tracking_no, cod_amount, status, delivered_on) VALUES
+(1, 'TRK1001', 450.00, 'IN_TRANSIT', NULL),                        -- Active COD parcel ready to deliver
+(1, 'TRK1002',   0.00, 'IN_TRANSIT', NULL),                        -- Prepaid parcel (COD = 0)
+(2, 'TRK1003', 820.00, 'IN_TRANSIT', NULL),                        -- Active COD parcel ready to deliver
+(2, 'TRK1004', 300.00, 'DELIVERED',  CURRENT_DATE - INTERVAL '1 day'),
+(3, 'TRK1005', 600.00, 'DELIVERED',  CURRENT_DATE - INTERVAL '1 day'),
+(3, 'TRK1006', 250.00, 'RETURNED',   NULL);
+
+-- Seed matching COD collection rows for already-delivered COD parcels (4 and 5)
+INSERT INTO cod_collections (parcel_id, amount, collected_on) VALUES
+(4, 300.00, CURRENT_DATE - INTERVAL '1 day'),
+(5, 600.00, CURRENT_DATE - INTERVAL '1 day');
+
+
+
+(b) Function: fn_courier_cod_due [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_courier_cod_due(
+    p_courier_id INTEGER
+) RETURNS NUMERIC(12, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_total_due NUMERIC(12, 2);
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM couriers WHERE courier_id = p_courier_id) THEN
+        RAISE EXCEPTION 'Courier ID % does not exist.', p_courier_id;
+    END IF;
+
+    SELECT COALESCE(SUM(cod_amount), 0.00)
+    INTO v_total_due
+    FROM parcels
+    WHERE courier_id = p_courier_id
+      AND status = 'IN_TRANSIT';
+
+    RETURN v_total_due;
+END;
+$$;
+
+
+(c) Procedure: pr_deliver_parcel [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_deliver_parcel(
+    p_parcel_id    INTEGER,
+    p_delivered_on DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status     VARCHAR(20);
+    v_cod_amount NUMERIC(10, 2);
+BEGIN
+    IF p_delivered_on IS NULL THEN
+        RAISE EXCEPTION 'Delivery date cannot be NULL.';
+    END IF;
+
+    -- Lock parcel row to prevent duplicate or concurrent deliveries
+    SELECT status, cod_amount
+    INTO v_status, v_cod_amount
+    FROM parcels
+    WHERE parcel_id = p_parcel_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown parcel_id: %', p_parcel_id;
+    END IF;
+
+    IF v_status <> 'IN_TRANSIT' THEN
+        RAISE EXCEPTION 'Parcel ID % cannot be delivered (current status: %).',
+            p_parcel_id, v_status;
+    END IF;
+
+    -- Mark parcel as DELIVERED
+    UPDATE parcels
+    SET status = 'DELIVERED',
+        delivered_on = p_delivered_on
+    WHERE parcel_id = p_parcel_id;
+
+    -- Insert COD collection record only when cod_amount > 0
+    IF v_cod_amount > 0 THEN
+        INSERT INTO cod_collections (parcel_id, amount, collected_on)
+        VALUES (p_parcel_id, v_cod_amount, p_delivered_on);
+    END IF;
+END;
+$$;
+
+
+
+(d) Trigger: trg_cod_parcel_guard [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_guard_cod_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status     VARCHAR(20);
+    v_cod_amount NUMERIC(10, 2);
+BEGIN
+    SELECT status, cod_amount
+    INTO v_status, v_cod_amount
+    FROM parcels
+    WHERE parcel_id = NEW.parcel_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Parcel ID % does not exist.', NEW.parcel_id;
+    END IF;
+
+    IF v_status <> 'DELIVERED' THEN
+        RAISE EXCEPTION 'Cannot record COD collection for parcel ID %: status must be DELIVERED (current: %).',
+            NEW.parcel_id, v_status;
+    END IF;
+
+    IF v_cod_amount <= 0 THEN
+        RAISE EXCEPTION 'Cannot record COD collection for parcel ID %: parcel has no COD amount (cod_amount = %).',
+            NEW.parcel_id, v_cod_amount;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_cod_parcel_guard
+BEFORE INSERT ON cod_collections
+FOR EACH ROW
+EXECUTE FUNCTION fn_guard_cod_insert();
+
+
+(e) View: v_courier_cod_due [5 marks]
+
+CREATE OR REPLACE VIEW v_courier_cod_due AS
+SELECT
+    c.courier_id,
+    c.courier_name,
+    COUNT(p.parcel_id) AS in_transit_parcels,
+    fn_courier_cod_due(c.courier_id) AS total_cod_due
+FROM couriers c
+LEFT JOIN parcels p
+       ON p.courier_id = c.courier_id
+      AND p.status = 'IN_TRANSIT'
+GROUP BY c.courier_id, c.courier_name;
+
+-- Test view before and after delivering Parcel 1 (TRK1001, COD = 450.00)
+SELECT * FROM v_courier_cod_due;
+CALL pr_deliver_parcel(1, CURRENT_DATE);
+SELECT * FROM v_courier_cod_due; -- Chanda Mulenga's COD due drops from 450.00 to 0.00
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_parcels_in_transit_courier
+ON parcels (courier_id)
+WHERE status = 'IN_TRANSIT';
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT parcel_id, tracking_no, cod_amount
+FROM parcels
+WHERE status = 'IN_TRANSIT'
+  AND courier_id = 2;
+
+
+
+(g) Scheduled Job: pr_refresh_cod [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_cod(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_total NUMERIC(12, 2);
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(amount), 0.00)
+    INTO v_count, v_total
+    FROM cod_collections
+    WHERE collected_on = p_day;
+
+    INSERT INTO daily_cod (cod_date, parcel_count, total_collected)
+    VALUES (p_day, v_count, v_total)
+    ON CONFLICT (cod_date)
+    DO UPDATE SET
+        parcel_count    = EXCLUDED.parcel_count,
+        total_collected = EXCLUDED.total_collected;
+END;
+$$;
+
+-- Schedule daily at 01:00 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_cod',
+    '0 1 * * *',
+    $$CALL pr_refresh_cod((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
+
+
+
