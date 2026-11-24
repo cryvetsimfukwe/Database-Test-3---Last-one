@@ -1,0 +1,221 @@
+Question 6: Warehouse Batch Dispatch and Expiry Control (PostgreSQL)
+
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE batches (
+    batch_id     SERIAL PRIMARY KEY,
+    product_name VARCHAR(100) NOT NULL,
+    expiry_date  DATE NOT NULL,
+    qty_on_hand  INTEGER NOT NULL CHECK (qty_on_hand >= 0)
+);
+
+CREATE TABLE dispatches (
+    dispatch_id   SERIAL PRIMARY KEY,
+    batch_id      INTEGER NOT NULL REFERENCES batches(batch_id),
+    qty_dispatched INTEGER NOT NULL CHECK (qty_dispatched > 0),
+    dispatched_on DATE NOT NULL DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE batch_audit (
+    audit_id   SERIAL PRIMARY KEY,
+    batch_id   INTEGER NOT NULL REFERENCES batches(batch_id),
+    old_qty    INTEGER NOT NULL,
+    new_qty    INTEGER NOT NULL,
+    changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_dispatches (
+    dispatch_date  DATE PRIMARY KEY,
+    dispatch_count INTEGER NOT NULL DEFAULT 0,
+    total_qty      INTEGER NOT NULL DEFAULT 0
+);
+
+-- Seed four batches:
+-- Batch 1: Expired batch
+-- Batch 2: Expiring within 14 days (e.g., 7 days from now)
+-- Batch 3: Expiring within 14 days (e.g., 12 days from now)
+-- Batch 4: Valid long-dated batch (90 days from now)
+INSERT INTO batches (product_name, expiry_date, qty_on_hand) VALUES
+('Fresh Milk 1L',         CURRENT_DATE - INTERVAL '3 days',  40),
+('Greek Yogurt 500g',     CURRENT_DATE + INTERVAL '7 days',  60),
+('Cheddar Cheese 250g',   CURRENT_DATE + INTERVAL '12 days', 35),
+('UHT Juice Pack 1L',     CURRENT_DATE + INTERVAL '90 days', 120);
+
+
+
+(b) Function: fn_days_to_expiry [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_days_to_expiry(
+    p_batch_id   INTEGER,
+    p_as_of_date DATE DEFAULT CURRENT_DATE
+) RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_expiry_date DATE;
+BEGIN
+    IF p_as_of_date IS NULL THEN
+        RAISE EXCEPTION 'Reference date (p_as_of_date) cannot be NULL.';
+    END IF;
+
+    SELECT expiry_date INTO v_expiry_date
+    FROM batches
+    WHERE batch_id = p_batch_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Batch ID % does not exist.', p_batch_id;
+    END IF;
+
+    RETURN v_expiry_date - p_as_of_date;
+END;
+$$;
+
+
+(c) Procedure: pr_dispatch_batch [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_dispatch_batch(
+    p_batch_id      INTEGER,
+    p_qty           INTEGER,
+    p_dispatched_on DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_expiry_date DATE;
+    v_qty_on_hand INTEGER;
+BEGIN
+    IF p_qty IS NULL OR p_qty <= 0 THEN
+        RAISE EXCEPTION 'Dispatch quantity must be greater than zero.';
+    END IF;
+
+    IF p_dispatched_on IS NULL THEN
+        RAISE EXCEPTION 'Dispatch date cannot be NULL.';
+    END IF;
+
+    -- Lock batch row to prevent concurrent over-dispatching
+    SELECT expiry_date, qty_on_hand
+    INTO v_expiry_date, v_qty_on_hand
+    FROM batches
+    WHERE batch_id = p_batch_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown batch_id: %', p_batch_id;
+    END IF;
+
+    IF v_expiry_date <= p_dispatched_on THEN
+        RAISE EXCEPTION 'Cannot dispatch expired batch ID % (expiry_date: %, dispatched_on: %).',
+            p_batch_id, v_expiry_date, p_dispatched_on;
+    END IF;
+
+    IF v_qty_on_hand < p_qty THEN
+        RAISE EXCEPTION 'Insufficient stock in batch ID %. Available: %, Requested: %',
+            p_batch_id, v_qty_on_hand, p_qty;
+    END IF;
+
+    -- Record dispatch and deduct quantity once
+    INSERT INTO dispatches (batch_id, qty_dispatched, dispatched_on)
+    VALUES (p_batch_id, p_qty, p_dispatched_on);
+
+    UPDATE batches
+    SET qty_on_hand = qty_on_hand - p_qty
+    WHERE batch_id = p_batch_id;
+END;
+$$;
+
+
+
+(d) Trigger: trg_batches_audit [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_log_batch_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.qty_on_hand IS DISTINCT FROM OLD.qty_on_hand THEN
+        INSERT INTO batch_audit (batch_id, old_qty, new_qty, changed_at)
+        VALUES (NEW.batch_id, OLD.qty_on_hand, NEW.qty_on_hand, CURRENT_TIMESTAMP);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_batches_audit
+AFTER UPDATE ON batches
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_batch_change();
+
+-- Load five valid dispatches from non-expired batches (completing part a)
+CALL pr_dispatch_batch(2, 15, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_dispatch_batch(2, 10, CURRENT_DATE);
+CALL pr_dispatch_batch(3, 10, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_dispatch_batch(4, 25, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_dispatch_batch(4, 30, CURRENT_DATE);
+
+
+
+(e) View: v_expiring_batches [5 marks]
+
+CREATE OR REPLACE VIEW v_expiring_batches AS
+SELECT
+    batch_id,
+    product_name,
+    expiry_date,
+    qty_on_hand,
+    fn_days_to_expiry(batch_id, CURRENT_DATE) AS days_remaining
+FROM batches
+WHERE qty_on_hand > 0
+  AND fn_days_to_expiry(batch_id, CURRENT_DATE) BETWEEN 0 AND 14;
+
+-- Verify view output (Batch 1 is excluded because it is expired; Batch 4 is > 14 days; Batches 2 & 3 appear)
+SELECT * FROM v_expiring_batches;
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_batches_active_expiry
+ON batches (expiry_date)
+WHERE qty_on_hand > 0;
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT batch_id, product_name, expiry_date, qty_on_hand
+FROM batches
+WHERE qty_on_hand > 0
+  AND expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '14 days';
+
+
+(g) Scheduled Job: pr_refresh_dispatches [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_dispatches(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_qty   INTEGER;
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(qty_dispatched), 0)
+    INTO v_count, v_qty
+    FROM dispatches
+    WHERE dispatched_on = p_day;
+
+    INSERT INTO daily_dispatches (dispatch_date, dispatch_count, total_qty)
+    VALUES (p_day, v_count, v_qty)
+    ON CONFLICT (dispatch_date)
+    DO UPDATE SET
+        dispatch_count = EXCLUDED.dispatch_count,
+        total_qty      = EXCLUDED.total_qty;
+END;
+$$;
+
+-- Schedule daily at 00:40 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_dispatches',
+    '40 0 * * *',
+    $$CALL pr_refresh_dispatches((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
