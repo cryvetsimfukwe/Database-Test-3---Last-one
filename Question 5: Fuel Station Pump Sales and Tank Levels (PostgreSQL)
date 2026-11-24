@@ -1,0 +1,204 @@
+Question 5: Fuel Station Pump Sales and Tank Levels (PostgreSQL)
+
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE tanks (
+    tank_id         SERIAL PRIMARY KEY,
+    fuel_type       VARCHAR(30) NOT NULL UNIQUE,
+    price_per_litre NUMERIC(10, 2) NOT NULL CHECK (price_per_litre > 0),
+    current_litres  NUMERIC(12, 2) NOT NULL CHECK (current_litres >= 0)
+);
+
+CREATE TABLE pump_sales (
+    sale_id         SERIAL PRIMARY KEY,
+    tank_id         INTEGER NOT NULL REFERENCES tanks(tank_id),
+    litres          NUMERIC(10, 2) NOT NULL CHECK (litres > 0),
+    price_per_litre NUMERIC(10, 2) NOT NULL CHECK (price_per_litre > 0),
+    sold_on         DATE NOT NULL DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE tank_audit (
+    audit_id   SERIAL PRIMARY KEY,
+    tank_id    INTEGER NOT NULL REFERENCES tanks(tank_id),
+    old_litres NUMERIC(12, 2) NOT NULL,
+    new_litres NUMERIC(12, 2) NOT NULL,
+    changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_fuel_sales (
+    sales_date   DATE PRIMARY KEY,
+    total_litres NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    total_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed three fuel tanks (Petrol, Diesel, Kerosene)
+INSERT INTO tanks (fuel_type, price_per_litre, current_litres) VALUES
+('Petrol',   29.92, 1200.00),
+('Diesel',   26.98,  650.00),
+('Kerosene', 20.44,  450.00);
+
+
+(b) Function: fn_fuel_sale_total [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_fuel_sale_total(
+    p_tank_id INTEGER,
+    p_litres  NUMERIC(10, 2)
+) RETURNS NUMERIC(14, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_price NUMERIC(10, 2);
+BEGIN
+    IF p_litres IS NULL OR p_litres <= 0 THEN
+        RAISE EXCEPTION 'Invalid litres: %. Quantity must be positive.', p_litres;
+    END IF;
+
+    SELECT price_per_litre INTO v_price
+    FROM tanks
+    WHERE tank_id = p_tank_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Tank ID % does not exist.', p_tank_id;
+    END IF;
+
+    RETURN ROUND(v_price * p_litres, 2);
+END;
+$$;
+
+(c) Procedure: pr_record_pump_sale [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_record_pump_sale(
+    p_tank_id INTEGER,
+    p_litres  NUMERIC(10, 2),
+    p_sold_on DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_price          NUMERIC(10, 2);
+    v_current_litres NUMERIC(12, 2);
+BEGIN
+    IF p_litres IS NULL OR p_litres <= 0 THEN
+        RAISE EXCEPTION 'Litres sold must be greater than zero.';
+    END IF;
+
+    IF p_sold_on IS NULL THEN
+        RAISE EXCEPTION 'Sale date cannot be NULL.';
+    END IF;
+
+    -- Lock tank row to prevent concurrent over-dispensing
+    SELECT price_per_litre, current_litres
+    INTO v_price, v_current_litres
+    FROM tanks
+    WHERE tank_id = p_tank_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown tank_id: %', p_tank_id;
+    END IF;
+
+    IF v_current_litres < p_litres THEN
+        RAISE EXCEPTION 'Insufficient fuel in tank_id %. Available: % L, Requested: % L',
+            p_tank_id, v_current_litres, p_litres;
+    END IF;
+
+    -- Insert pump sale using current tank price
+    INSERT INTO pump_sales (tank_id, litres, price_per_litre, sold_on)
+    VALUES (p_tank_id, p_litres, v_price, p_sold_on);
+
+    -- Deduct dispensed litres once
+    UPDATE tanks
+    SET current_litres = current_litres - p_litres
+    WHERE tank_id = p_tank_id;
+END;
+$$;
+
+(d) Trigger: trg_tanks_audit [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_log_tank_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.current_litres IS DISTINCT FROM OLD.current_litres THEN
+        INSERT INTO tank_audit (tank_id, old_litres, new_litres, changed_at)
+        VALUES (NEW.tank_id, OLD.current_litres, NEW.current_litres, CURRENT_TIMESTAMP);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_tanks_audit
+AFTER UPDATE ON tanks
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_tank_change();
+
+-- Load six valid pump sales (completing part a)
+CALL pr_record_pump_sale(1, 150.00, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_record_pump_sale(1, 200.00, CURRENT_DATE); -- Petrol drops to 850 L
+CALL pr_record_pump_sale(2, 120.00, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_record_pump_sale(2,  80.00, CURRENT_DATE); -- Diesel drops to 450 L (< 500 L)
+CALL pr_record_pump_sale(3,  60.00, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_record_pump_sale(3,  40.00, CURRENT_DATE); -- Kerosene drops to 350 L (< 500 L)
+
+
+(e) View: v_low_tanks [5 marks]
+
+CREATE OR REPLACE VIEW v_low_tanks AS
+SELECT
+    fuel_type,
+    price_per_litre,
+    current_litres AS remaining_litres
+FROM tanks
+WHERE current_litres < 500;
+
+-- Verify view output (Diesel at 450 L and Kerosene at 350 L appear)
+SELECT * FROM v_low_tanks;
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_pump_sales_tank_date
+ON pump_sales (tank_id, sold_on);
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT sale_id, litres, price_per_litre, sold_on
+FROM pump_sales
+WHERE tank_id = 1
+  AND sold_on BETWEEN CURRENT_DATE - INTERVAL '7 days' AND CURRENT_DATE;
+
+
+(g) Scheduled Job: pr_refresh_fuel_sales [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_fuel_sales(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_litres NUMERIC(12, 2);
+    v_amount NUMERIC(14, 2);
+BEGIN
+    SELECT
+        COALESCE(SUM(litres), 0.00),
+        COALESCE(SUM(litres * price_per_litre), 0.00)
+    INTO v_litres, v_amount
+    FROM pump_sales
+    WHERE sold_on = p_day;
+
+    INSERT INTO daily_fuel_sales (sales_date, total_litres, total_amount)
+    VALUES (p_day, v_litres, v_amount)
+    ON CONFLICT (sales_date)
+    DO UPDATE SET
+        total_litres = EXCLUDED.total_litres,
+        total_amount = EXCLUDED.total_amount;
+END;
+$$;
+
+-- Schedule daily at 00:20 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_fuel_sales',
+    '20 0 * * *',
+    $$CALL pr_refresh_fuel_sales((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
