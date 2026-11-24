@@ -1,0 +1,197 @@
+
+Question 2: University Fee Payments (PostgreSQL)
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE students (
+    student_id     SERIAL PRIMARY KEY,
+    student_number VARCHAR(20) NOT NULL UNIQUE,
+    full_name      VARCHAR(100) NOT NULL,
+    fee_due        NUMERIC(12, 2) NOT NULL CHECK (fee_due >= 0)
+);
+
+CREATE TABLE payments (
+    payment_id SERIAL PRIMARY KEY,
+    student_id INTEGER NOT NULL REFERENCES students(student_id),
+    amount     NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+    paid_on    DATE NOT NULL DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE payment_audit (
+    audit_id   SERIAL PRIMARY KEY,
+    payment_id INTEGER NOT NULL REFERENCES payments(payment_id),
+    student_id INTEGER NOT NULL REFERENCES students(student_id),
+    amount     NUMERIC(12, 2) NOT NULL,
+    logged_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_collections (
+    collection_date DATE PRIMARY KEY,
+    payment_count   INTEGER NOT NULL DEFAULT 0,
+    total_amount    NUMERIC(12, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed three students with different fee balances
+INSERT INTO students (student_number, full_name, fee_due) VALUES
+('STU2026001', 'Chanda Mwansa', 12000.00),
+('STU2026002', 'Bwalya Phiri',   8500.00),
+('STU2026003', 'Mutale Banda',  15000.00); -- Will initially have no payments
+
+
+(b) Function: fn_fee_balance [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_fee_balance(
+    p_student_id INTEGER
+) RETURNS NUMERIC(12, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_fee_due    NUMERIC(12, 2);
+    v_total_paid NUMERIC(12, 2);
+BEGIN
+    SELECT fee_due INTO v_fee_due
+    FROM students
+    WHERE student_id = p_student_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Student ID % does not exist.', p_student_id;
+    END IF;
+
+    SELECT COALESCE(SUM(amount), 0.00) INTO v_total_paid
+    FROM payments
+    WHERE student_id = p_student_id;
+
+    RETURN v_fee_due - v_total_paid;
+END;
+$$;
+
+
+(c) Procedure: pr_receive_payment [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_receive_payment(
+    p_student_id INTEGER,
+    p_amount     NUMERIC(12, 2),
+    p_paid_on    DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_balance NUMERIC(12, 2);
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Payment amount must be greater than zero.';
+    END IF;
+
+    IF p_paid_on IS NULL THEN
+        RAISE EXCEPTION 'Payment date cannot be NULL.';
+    END IF;
+
+    -- Lock student row to prevent race conditions causing credit balances
+    PERFORM 1 FROM students WHERE student_id = p_student_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown student_id: %', p_student_id;
+    END IF;
+
+    v_balance := fn_fee_balance(p_student_id);
+
+    IF p_amount > v_balance THEN
+        RAISE EXCEPTION 'Payment of % exceeds outstanding balance of % for student_id %.',
+            p_amount, v_balance, p_student_id;
+    END IF;
+
+    -- Insert valid payment without modifying students.fee_due
+    INSERT INTO payments (student_id, amount, paid_on)
+    VALUES (p_student_id, p_amount, p_paid_on);
+END;
+$$;
+
+
+
+(d) Trigger: trg_payments_audit [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_log_payment_audit()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO payment_audit (payment_id, student_id, amount, logged_at)
+    VALUES (NEW.payment_id, NEW.student_id, NEW.amount, CURRENT_TIMESTAMP);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_payments_audit
+AFTER INSERT ON payments
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_payment_audit();
+
+-- Load six valid payments (completing part a; student 3 remains with no payments)
+CALL pr_receive_payment(1, 3000.00, CURRENT_DATE - INTERVAL '2 days');
+CALL pr_receive_payment(1, 4000.00, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_receive_payment(1, 5000.00, CURRENT_DATE); -- Student 1 is now fully settled (balance = 0)
+CALL pr_receive_payment(2, 2500.00, CURRENT_DATE - INTERVAL '2 days');
+CALL pr_receive_payment(2, 1500.00, CURRENT_DATE - INTERVAL '1 day');
+CALL pr_receive_payment(2, 1000.00, CURRENT_DATE); -- Student 2 still owes 3500.00
+
+
+(e) View: v_fee_balances [5 marks]
+
+CREATE OR REPLACE VIEW v_fee_balances AS
+SELECT
+    student_number,
+    full_name,
+    fn_fee_balance(student_id) AS outstanding_balance
+FROM students
+WHERE fn_fee_balance(student_id) > 0;
+
+-- Verify view output (Student 1 is excluded; Students 2 and 3 appear)
+SELECT * FROM v_fee_balances;
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_payments_student_date
+ON payments (student_id, paid_on);
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT payment_id, amount, paid_on
+FROM payments
+WHERE student_id = 2
+  AND paid_on BETWEEN CURRENT_DATE - INTERVAL '7 days' AND CURRENT_DATE;
+
+
+(g) Scheduled Job: pr_refresh_collections [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_collections(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count  INTEGER;
+    v_amount NUMERIC(12, 2);
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(amount), 0.00)
+    INTO v_count, v_amount
+    FROM payments
+    WHERE paid_on = p_day;
+
+    INSERT INTO daily_collections (collection_date, payment_count, total_amount)
+    VALUES (p_day, v_count, v_amount)
+    ON CONFLICT (collection_date)
+    DO UPDATE SET
+        payment_count = EXCLUDED.payment_count,
+        total_amount  = EXCLUDED.total_amount;
+END;
+$$;
+
+-- Schedule daily at 01:00 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_collections',
+    '0 1 * * *',
+    $$CALL pr_refresh_collections((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
+
+
