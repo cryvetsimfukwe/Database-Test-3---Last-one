@@ -1,0 +1,251 @@
+Question 3: Library Returns and Overdue Fines (PostgreSQL)
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE books (
+    book_id    SERIAL PRIMARY KEY,
+    title      VARCHAR(150) NOT NULL,
+    daily_fine NUMERIC(8, 2) NOT NULL CHECK (daily_fine > 0),
+    status     VARCHAR(20) NOT NULL DEFAULT 'AVAILABLE'
+               CHECK (status IN ('AVAILABLE', 'LOANED'))
+);
+
+CREATE TABLE loans (
+    loan_id     SERIAL PRIMARY KEY,
+    book_id     INTEGER NOT NULL REFERENCES books(book_id),
+    member_name VARCHAR(100) NOT NULL,
+    due_date    DATE NOT NULL,
+    returned_on DATE NULL
+);
+
+CREATE TABLE fine_charges (
+    charge_id   SERIAL PRIMARY KEY,
+    loan_id     INTEGER NOT NULL UNIQUE REFERENCES loans(loan_id),
+    fine_amount NUMERIC(10, 2) NOT NULL CHECK (fine_amount >= 0),
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_fines (
+    fine_date   DATE PRIMARY KEY,
+    fine_count  INTEGER NOT NULL DEFAULT 0,
+    total_fines NUMERIC(12, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed four books (3 currently loaned out, 1 available)
+INSERT INTO books (title, daily_fine, status) VALUES
+('Database System Concepts',     5.00, 'LOANED'),
+('PostgreSQL Internals',         7.50, 'LOANED'),
+('Distributed Systems Design',  10.00, 'LOANED'),
+('Clean Architecture',           4.00, 'AVAILABLE');
+
+-- Seed six loans:
+-- Loans 1-3: already returned (on time, 3 days late, 5 days late)
+-- Loans 4-6: active unreturned loans (due in future, 4 days overdue, 2 days overdue)
+INSERT INTO loans (book_id, member_name, due_date, returned_on) VALUES
+(4, 'Chilufya Kasonde', CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE - INTERVAL '11 days'), -- On time
+(1, 'Mumba Tembo',      CURRENT_DATE - INTERVAL '15 days', CURRENT_DATE - INTERVAL '12 days'), -- 3 days late
+(2, 'Mwila Chanda',     CURRENT_DATE - INTERVAL '20 days', CURRENT_DATE - INTERVAL '15 days'), -- 5 days late
+(1, 'Kasongo Mulenga',  CURRENT_DATE + INTERVAL '5 days',  NULL), -- Active, not yet due
+(2, 'Natasha Zulu',     CURRENT_DATE - INTERVAL '4 days',  NULL), -- Active, 4 days overdue
+(3, 'Kabwe Phiri',      CURRENT_DATE - INTERVAL '2 days',  NULL); -- Active, 2 days overdue
+
+
+(b) Function: fn_overdue_fine [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_overdue_fine(
+    p_loan_id     INTEGER,
+    p_returned_on DATE
+) RETURNS NUMERIC(10, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_due_date   DATE;
+    v_daily_fine NUMERIC(8, 2);
+    v_days_late  INTEGER;
+BEGIN
+    IF p_returned_on IS NULL THEN
+        RAISE EXCEPTION 'Return date cannot be NULL.';
+    END IF;
+
+    SELECT l.due_date, b.daily_fine
+    INTO v_due_date, v_daily_fine
+    FROM loans l
+    JOIN books b ON b.book_id = l.book_id
+    WHERE l.loan_id = p_loan_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Loan ID % does not exist.', p_loan_id;
+    END IF;
+
+    v_days_late := p_returned_on - v_due_date;
+
+    IF v_days_late <= 0 THEN
+        RETURN 0.00;
+    END IF;
+
+    RETURN v_days_late * v_daily_fine;
+END;
+$$;
+
+
+(c) Procedure: pr_return_book [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_return_book(
+    p_loan_id     INTEGER,
+    p_returned_on DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_book_id     INTEGER;
+    v_returned_on DATE;
+    v_fine        NUMERIC(10, 2);
+BEGIN
+    IF p_returned_on IS NULL THEN
+        RAISE EXCEPTION 'Return date cannot be NULL.';
+    END IF;
+
+    -- Lock the loan row to prevent duplicate/concurrent returns
+    SELECT book_id, returned_on
+    INTO v_book_id, v_returned_on
+    FROM loans
+    WHERE loan_id = p_loan_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown loan_id: %', p_loan_id;
+    END IF;
+
+    IF v_returned_on IS NOT NULL THEN
+        RAISE EXCEPTION 'Loan ID % was already returned on %.', p_loan_id, v_returned_on;
+    END IF;
+
+    -- Calculate overdue fine before updating
+    v_fine := fn_overdue_fine(p_loan_id, p_returned_on);
+
+    -- Record return date and mark book available
+    UPDATE loans
+    SET returned_on = p_returned_on
+    WHERE loan_id = p_loan_id;
+
+    UPDATE books
+    SET status = 'AVAILABLE'
+    WHERE book_id = v_book_id;
+
+    -- Insert fine charge only when fine > 0
+    IF v_fine > 0 THEN
+        INSERT INTO fine_charges (loan_id, fine_amount, created_at)
+        VALUES (p_loan_id, v_fine, CURRENT_TIMESTAMP);
+    END IF;
+END;
+$$;
+
+(d) Trigger: trg_loans_status_guard [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_guard_book_loan_status()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status VARCHAR(20);
+BEGIN
+    -- Only enforce availability check when creating an active (unreturned) loan
+    IF NEW.returned_on IS NULL THEN
+        SELECT status INTO v_status
+        FROM books
+        WHERE book_id = NEW.book_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Book ID % does not exist.', NEW.book_id;
+        END IF;
+
+        IF v_status <> 'AVAILABLE' THEN
+            RAISE EXCEPTION 'Cannot loan book ID %: current status is % (must be AVAILABLE).',
+                NEW.book_id, v_status;
+        END IF;
+
+        UPDATE books
+        SET status = 'LOANED'
+        WHERE book_id = NEW.book_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_loans_status_guard
+BEFORE INSERT ON loans
+FOR EACH ROW
+EXECUTE FUNCTION fn_guard_book_loan_status();
+
+
+(e) View: v_overdue_loans [5 marks]
+
+CREATE OR REPLACE VIEW v_overdue_loans AS
+SELECT
+    l.loan_id,
+    b.title,
+    l.member_name,
+    l.due_date,
+    (CURRENT_DATE - l.due_date) AS days_overdue,
+    fn_overdue_fine(l.loan_id, CURRENT_DATE) AS estimated_fine
+FROM loans l
+JOIN books b ON b.book_id = l.book_id
+WHERE l.returned_on IS NULL
+  AND l.due_date < CURRENT_DATE;
+
+-- Test view before and after returning an overdue loan
+SELECT * FROM v_overdue_loans;
+CALL pr_return_book(5, CURRENT_DATE); -- Returns Natasha Zulu's overdue book
+SELECT * FROM v_overdue_loans;        -- Loan 5 is now removed from overdue loans
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_loans_active_due_date
+ON loans (due_date)
+WHERE returned_on IS NULL;
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT loan_id, book_id, member_name, due_date
+FROM loans
+WHERE returned_on IS NULL
+  AND due_date < CURRENT_DATE;
+
+
+
+(g) Scheduled Job: pr_refresh_fines [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_fines(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_total NUMERIC(12, 2);
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(fine_amount), 0.00)
+    INTO v_count, v_total
+    FROM fine_charges
+    WHERE created_at::DATE = p_day;
+
+    INSERT INTO daily_fines (fine_date, fine_count, total_fines)
+    VALUES (p_day, v_count, v_total)
+    ON CONFLICT (fine_date)
+    DO UPDATE SET
+        fine_count  = EXCLUDED.fine_count,
+        total_fines = EXCLUDED.total_fines;
+END;
+$$;
+
+-- Schedule daily at 00:30 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_fines',
+    '30 0 * * *',
+    $$CALL pr_refresh_fines((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
