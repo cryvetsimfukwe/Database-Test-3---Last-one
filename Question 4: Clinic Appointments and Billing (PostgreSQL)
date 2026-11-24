@@ -1,0 +1,234 @@
+Question 4: Clinic Appointments and Billing (PostgreSQL)
+
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE doctors (
+    doctor_id        SERIAL PRIMARY KEY,
+    doctor_name      VARCHAR(100) NOT NULL,
+    specialty        VARCHAR(80) NOT NULL,
+    consultation_fee NUMERIC(10, 2) NOT NULL CHECK (consultation_fee > 0)
+);
+
+CREATE TABLE appointments (
+    appointment_id SERIAL PRIMARY KEY,
+    doctor_id      INTEGER NOT NULL REFERENCES doctors(doctor_id),
+    patient_name   VARCHAR(100) NOT NULL,
+    appt_date      DATE NOT NULL,
+    status         VARCHAR(20) NOT NULL DEFAULT 'BOOKED'
+                   CHECK (status IN ('BOOKED', 'COMPLETED', 'CANCELLED'))
+);
+
+CREATE TABLE bills (
+    bill_id        SERIAL PRIMARY KEY,
+    appointment_id INTEGER NOT NULL UNIQUE REFERENCES appointments(appointment_id),
+    total_charge   NUMERIC(10, 2) NOT NULL CHECK (total_charge >= 0),
+    billed_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_billing (
+    billing_date  DATE PRIMARY KEY,
+    bill_count    INTEGER NOT NULL DEFAULT 0,
+    total_revenue NUMERIC(12, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed three doctors
+INSERT INTO doctors (doctor_name, specialty, consultation_fee) VALUES
+('Dr. Mutinta Nkandu', 'General Practice', 250.00),
+('Dr. Chileshe Banda', 'Pediatrics',       350.00),
+('Dr. Lubinda Mwale',  'Cardiology',       500.00);
+
+-- Seed six appointments in mixed states (BOOKED, COMPLETED, CANCELLED)
+INSERT INTO appointments (doctor_id, patient_name, appt_date, status) VALUES
+(1, 'Thabo Mwanza',     CURRENT_DATE - INTERVAL '1 day', 'BOOKED'),    -- Ready to complete
+(2, 'Bupe Chanda',      CURRENT_DATE - INTERVAL '1 day', 'BOOKED'),    -- Ready to complete
+(3, 'Mapalo Phiri',     CURRENT_DATE,                    'BOOKED'),    -- Active booked
+(1, 'Twalumba Zulu',    CURRENT_DATE,                    'CANCELLED'), -- Cancelled
+(2, 'Mwewa Kasonde',    CURRENT_DATE + INTERVAL '1 day', 'BOOKED'),    -- Future booked
+(3, 'Chishimba Tembo',  CURRENT_DATE - INTERVAL '2 days','CANCELLED'); -- Cancelled
+
+
+
+(b) Function: fn_bill_total [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_bill_total(
+    p_appointment_id INTEGER,
+    p_extra_charge   NUMERIC(10, 2) DEFAULT 0.00
+) RETURNS NUMERIC(10, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_fee NUMERIC(10, 2);
+BEGIN
+    IF p_extra_charge IS NULL OR p_extra_charge < 0 THEN
+        RAISE EXCEPTION 'Extra charge cannot be negative or NULL (got %).', p_extra_charge;
+    END IF;
+
+    SELECT d.consultation_fee INTO v_fee
+    FROM appointments a
+    JOIN doctors d ON d.doctor_id = a.doctor_id
+    WHERE a.appointment_id = p_appointment_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Appointment ID % does not exist.', p_appointment_id;
+    END IF;
+
+    RETURN v_fee + p_extra_charge;
+END;
+$$;
+
+
+(c) Procedure: pr_complete_appointment [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_complete_appointment(
+    p_appointment_id INTEGER,
+    p_extra_charge   NUMERIC(10, 2) DEFAULT 0.00
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status VARCHAR(20);
+    v_total  NUMERIC(10, 2);
+BEGIN
+    -- Lock appointment row to prevent duplicate or concurrent billing
+    SELECT status INTO v_status
+    FROM appointments
+    WHERE appointment_id = p_appointment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown appointment_id: %', p_appointment_id;
+    END IF;
+
+    IF v_status = 'CANCELLED' THEN
+        RAISE EXCEPTION 'Appointment ID % is CANCELLED and cannot be completed or billed.', p_appointment_id;
+    END IF;
+
+    IF v_status = 'COMPLETED' THEN
+        RAISE EXCEPTION 'Appointment ID % is already COMPLETED and billed.', p_appointment_id;
+    END IF;
+
+    -- Compute total (also validates p_extra_charge >= 0)
+    v_total := fn_bill_total(p_appointment_id, p_extra_charge);
+
+    -- Update appointment status and create bill atomically
+    UPDATE appointments
+    SET status = 'COMPLETED'
+    WHERE appointment_id = p_appointment_id;
+
+    INSERT INTO bills (appointment_id, total_charge, billed_at)
+    VALUES (p_appointment_id, v_total, CURRENT_TIMESTAMP);
+END;
+$$;
+
+
+(d) Trigger: trg_bills_appointment_guard [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_guard_bill_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status VARCHAR(20);
+BEGIN
+    SELECT status INTO v_status
+    FROM appointments
+    WHERE appointment_id = NEW.appointment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Appointment ID % does not exist.', NEW.appointment_id;
+    END IF;
+
+    IF v_status <> 'COMPLETED' THEN
+        RAISE EXCEPTION 'Cannot bill appointment ID %: status must be COMPLETED (current: %).',
+            NEW.appointment_id, v_status;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM bills WHERE appointment_id = NEW.appointment_id) THEN
+        RAISE EXCEPTION 'Appointment ID % already has a bill.', NEW.appointment_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_bills_appointment_guard
+BEFORE INSERT ON bills
+FOR EACH ROW
+EXECUTE FUNCTION fn_guard_bill_insert();
+
+-- Complete two booked appointments via the procedure to generate valid bills
+CALL pr_complete_appointment(1, 50.00);  -- Total = 250 + 50 = 300.00
+CALL pr_complete_appointment(2, 0.00);   -- Total = 350 + 0  = 350.00
+
+
+
+(e) View: v_doctor_billing [5 marks]
+
+CREATE OR REPLACE VIEW v_doctor_billing AS
+SELECT
+    d.doctor_id,
+    d.doctor_name,
+    d.specialty,
+    COUNT(b.bill_id) AS completed_appointments,
+    COALESCE(SUM(b.total_charge), 0.00) AS total_billed_revenue
+FROM doctors d
+LEFT JOIN appointments a
+       ON a.doctor_id = d.doctor_id
+      AND a.status = 'COMPLETED'
+LEFT JOIN bills b
+       ON b.appointment_id = a.appointment_id
+GROUP BY d.doctor_id, d.doctor_name, d.specialty;
+
+-- Query the view (Dr. Lubinda Mwale shows 0 completed appointments and 0.00 revenue)
+SELECT * FROM v_doctor_billing;
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_appointments_doctor_date
+ON appointments (doctor_id, appt_date);
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT appointment_id, patient_name, appt_date, status
+FROM appointments
+WHERE doctor_id = 1
+  AND appt_date BETWEEN CURRENT_DATE - INTERVAL '7 days' AND CURRENT_DATE + INTERVAL '7 days';
+
+(g) Scheduled Job: pr_refresh_billing [6 marks]
+
+CREATE OR REPLACE PROCEDURE pr_refresh_billing(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count   INTEGER;
+    v_revenue NUMERIC(12, 2);
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(total_charge), 0.00)
+    INTO v_count, v_revenue
+    FROM bills
+    WHERE billed_at::DATE = p_day;
+
+    INSERT INTO daily_billing (billing_date, bill_count, total_revenue)
+    VALUES (p_day, v_count, v_revenue)
+    ON CONFLICT (billing_date)
+    DO UPDATE SET
+        bill_count    = EXCLUDED.bill_count,
+        total_revenue = EXCLUDED.total_revenue;
+END;
+$$;
+
+-- Schedule daily at 01:15 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_billing',
+    '15 1 * * *',
+    $$CALL pr_refresh_billing((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
+
+
