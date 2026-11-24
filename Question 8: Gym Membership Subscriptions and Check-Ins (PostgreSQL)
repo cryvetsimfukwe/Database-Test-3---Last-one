@@ -1,0 +1,210 @@
+Question 8: Gym Membership Subscriptions and Check-Ins (PostgreSQL)
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE members (
+    member_id   SERIAL PRIMARY KEY,
+    member_code VARCHAR(20) NOT NULL UNIQUE,
+    full_name   VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE subscriptions (
+    sub_id     SERIAL PRIMARY KEY,
+    member_id  INTEGER NOT NULL REFERENCES members(member_id),
+    plan_name  VARCHAR(50) NOT NULL,
+    start_date DATE NOT NULL,
+    end_date   DATE NOT NULL CHECK (end_date >= start_date)
+);
+
+CREATE TABLE checkins (
+    checkin_id   SERIAL PRIMARY KEY,
+    member_id    INTEGER NOT NULL REFERENCES members(member_id),
+    checked_in_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE checkin_audit (
+    audit_id   SERIAL PRIMARY KEY,
+    checkin_id INTEGER NOT NULL REFERENCES checkins(checkin_id),
+    member_id  INTEGER NOT NULL REFERENCES members(member_id),
+    logged_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_checkins (
+    checkin_date  DATE PRIMARY KEY,
+    checkin_count INTEGER NOT NULL DEFAULT 0
+);
+
+-- Seed four members
+INSERT INTO members (member_code, full_name) VALUES
+('GYM001', 'Chanda Mulenga'),
+('GYM002', 'Bwalya Phiri'),
+('GYM003', 'Mutale Banda'),
+('GYM004', 'Kasongo Tembo');
+
+-- Seed four subscriptions:
+-- Member 1: Active subscription
+-- Member 2: Active subscription
+-- Member 3: Expired subscription
+-- Member 4: No subscription at all
+INSERT INTO subscriptions (member_id, plan_name, start_date, end_date) VALUES
+(1, 'Annual Gold',   CURRENT_DATE - INTERVAL '60 days', CURRENT_DATE + INTERVAL '300 days'),
+(2, 'Monthly Basic', CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE + INTERVAL '20 days'),
+(3, 'Monthly Basic', CURRENT_DATE - INTERVAL '45 days', CURRENT_DATE - INTERVAL '15 days');
+
+
+
+
+(b) Function: fn_has_active_sub [6 marks]
+
+
+CREATE OR REPLACE FUNCTION fn_has_active_sub(
+    p_member_id INTEGER,
+    p_on_date   DATE DEFAULT CURRENT_DATE
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_on_date IS NULL THEN
+        RAISE EXCEPTION 'Check date (p_on_date) cannot be NULL.';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM members WHERE member_id = p_member_id) THEN
+        RAISE EXCEPTION 'Member ID % does not exist.', p_member_id;
+    END IF;
+
+    RETURN EXISTS (
+        SELECT 1
+        FROM subscriptions
+        WHERE member_id = p_member_id
+          AND p_on_date BETWEEN start_date AND end_date
+    );
+END;
+$$;
+
+
+
+(c) Procedure: pr_checkin_member [8 marks]
+
+
+CREATE OR REPLACE PROCEDURE pr_checkin_member(
+    p_member_id     INTEGER,
+    p_checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_checked_in_at IS NULL THEN
+        RAISE EXCEPTION 'Check-in timestamp cannot be NULL.';
+    END IF;
+
+    -- Lock member row to validate existence and serialize concurrent check-ins
+    PERFORM 1 FROM members WHERE member_id = p_member_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown member_id: %', p_member_id;
+    END IF;
+
+    IF NOT fn_has_active_sub(p_member_id, p_checked_in_at::DATE) THEN
+        RAISE EXCEPTION 'Check-in denied: Member ID % does not have an active subscription on %.',
+            p_member_id, p_checked_in_at::DATE;
+    END IF;
+
+    INSERT INTO checkins (member_id, checked_in_at)
+    VALUES (p_member_id, p_checked_in_at);
+END;
+$$;
+
+
+
+(d) Trigger: trg_checkins_audit [8 marks]
+
+
+CREATE OR REPLACE FUNCTION fn_log_checkin_audit()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO checkin_audit (checkin_id, member_id, logged_at)
+    VALUES (NEW.checkin_id, NEW.member_id, CURRENT_TIMESTAMP);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_checkins_audit
+AFTER INSERT ON checkins
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_checkin_audit();
+
+-- Load six valid check-ins for active members 1 and 2 (completing part a)
+CALL pr_checkin_member(1, CURRENT_TIMESTAMP - INTERVAL '2 days');
+CALL pr_checkin_member(1, CURRENT_TIMESTAMP - INTERVAL '1 day');
+CALL pr_checkin_member(1, CURRENT_TIMESTAMP);
+CALL pr_checkin_member(2, CURRENT_TIMESTAMP - INTERVAL '2 days');
+CALL pr_checkin_member(2, CURRENT_TIMESTAMP - INTERVAL '1 day');
+CALL pr_checkin_member(2, CURRENT_TIMESTAMP);
+
+
+
+(e) View: v_active_members [5 marks]
+
+
+CREATE OR REPLACE VIEW v_active_members AS
+SELECT
+    m.member_code,
+    m.full_name,
+    s.plan_name,
+    s.end_date
+FROM members m
+JOIN subscriptions s ON s.member_id = m.member_id
+WHERE CURRENT_DATE BETWEEN s.start_date AND s.end_date;
+
+-- Verify view output (Members 1 and 2 appear; expired Member 3 and unsubscribed Member 4 are excluded)
+SELECT * FROM v_active_members;
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_subscriptions_member_dates
+ON subscriptions (member_id, start_date, end_date);
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT sub_id, plan_name, start_date, end_date
+FROM subscriptions
+WHERE member_id = 1
+  AND start_date <= CURRENT_DATE
+  AND end_date >= CURRENT_DATE;
+
+
+
+(g) Scheduled Job: pr_refresh_checkins [6 marks]
+
+
+CREATE OR REPLACE PROCEDURE pr_refresh_checkins(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    SELECT COUNT(*)
+    INTO v_count
+    FROM checkins
+    WHERE checked_in_at::DATE = p_day;
+
+    INSERT INTO daily_checkins (checkin_date, checkin_count)
+    VALUES (p_day, v_count)
+    ON CONFLICT (checkin_date)
+    DO UPDATE SET
+        checkin_count = EXCLUDED.checkin_count;
+END;
+$$;
+
+-- Schedule daily at 00:10 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_checkins',
+    '10 0 * * *',
+    $$CALL pr_refresh_checkins((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
+
+
