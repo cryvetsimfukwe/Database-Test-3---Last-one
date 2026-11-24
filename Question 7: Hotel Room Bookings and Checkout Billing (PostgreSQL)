@@ -1,0 +1,236 @@
+Question 7: Hotel Room Bookings and Checkout Billing (PostgreSQL)
+
+
+(a) Database and Seed Data [6 marks]
+
+CREATE TABLE rooms (
+    room_id      SERIAL PRIMARY KEY,
+    room_number  VARCHAR(10) NOT NULL UNIQUE,
+    nightly_rate NUMERIC(10, 2) NOT NULL CHECK (nightly_rate > 0),
+    status       VARCHAR(20) NOT NULL DEFAULT 'AVAILABLE'
+                 CHECK (status IN ('AVAILABLE', 'OCCUPIED'))
+);
+
+CREATE TABLE bookings (
+    booking_id SERIAL PRIMARY KEY,
+    room_id    INTEGER NOT NULL REFERENCES rooms(room_id),
+    guest_name VARCHAR(100) NOT NULL,
+    check_in   DATE NOT NULL,
+    check_out  DATE NOT NULL CHECK (check_out > check_in),
+    status     VARCHAR(20) NOT NULL DEFAULT 'CHECKED_IN'
+               CHECK (status IN ('CHECKED_IN', 'CHECKED_OUT'))
+);
+
+CREATE TABLE invoices (
+    invoice_id   SERIAL PRIMARY KEY,
+    booking_id   INTEGER NOT NULL UNIQUE REFERENCES bookings(booking_id),
+    total_amount NUMERIC(12, 2) NOT NULL CHECK (total_amount >= 0),
+    issued_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_hotel_revenue (
+    revenue_date  DATE PRIMARY KEY,
+    checkout_count INTEGER NOT NULL DEFAULT 0,
+    total_revenue NUMERIC(14, 2) NOT NULL DEFAULT 0.00
+);
+
+-- Seed four rooms (3 occupied by active bookings, 1 available)
+INSERT INTO rooms (room_number, nightly_rate, status) VALUES
+('101', 850.00,  'OCCUPIED'),
+('102', 1100.00, 'OCCUPIED'),
+('201', 1500.00, 'OCCUPIED'),
+('202', 950.00,  'AVAILABLE');
+
+-- Seed five bookings:
+-- Bookings 1-2: already checked out (historical)
+-- Bookings 3-5: currently CHECKED_IN (occupying rooms 101, 102, 201)
+INSERT INTO bookings (room_id, guest_name, check_in, check_out, status) VALUES
+(4, 'Chanda Mulenga', CURRENT_DATE - INTERVAL '5 days', CURRENT_DATE - INTERVAL '3 days', 'CHECKED_OUT'), -- 2 nights
+(1, 'Bwalya Tembo',   CURRENT_DATE - INTERVAL '8 days', CURRENT_DATE - INTERVAL '5 days', 'CHECKED_OUT'), -- 3 nights
+(1, 'Mutale Banda',   CURRENT_DATE - INTERVAL '2 days', CURRENT_DATE,                    'CHECKED_IN'),  -- 2 nights, ready for checkout
+(2, 'Kasongo Phiri',  CURRENT_DATE - INTERVAL '3 days', CURRENT_DATE + INTERVAL '1 day', 'CHECKED_IN'),  -- 4 nights
+(3, 'Natasha Zulu',   CURRENT_DATE - INTERVAL '1 day',  CURRENT_DATE + INTERVAL '2 days','CHECKED_IN');  -- 3 nights
+
+(b) Function: fn_stay_cost [6 marks]
+
+CREATE OR REPLACE FUNCTION fn_stay_cost(
+    p_booking_id INTEGER
+) RETURNS NUMERIC(12, 2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_nights       INTEGER;
+    v_nightly_rate NUMERIC(10, 2);
+BEGIN
+    SELECT (b.check_out - b.check_in), r.nightly_rate
+    INTO v_nights, v_nightly_rate
+    FROM bookings b
+    JOIN rooms r ON r.room_id = b.room_id
+    WHERE b.booking_id = p_booking_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Booking ID % does not exist.', p_booking_id;
+    END IF;
+
+    IF v_nights IS NULL OR v_nights <= 0 THEN
+        RAISE EXCEPTION 'Invalid stay length (% nights) for booking ID %.', v_nights, p_booking_id;
+    END IF;
+
+    RETURN v_nights * v_nightly_rate;
+END;
+$$;
+
+
+(c) Procedure: pr_checkout_booking [8 marks]
+
+CREATE OR REPLACE PROCEDURE pr_checkout_booking(
+    p_booking_id INTEGER
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_room_id INTEGER;
+    v_status  VARCHAR(20);
+    v_total   NUMERIC(12, 2);
+BEGIN
+    -- Lock booking row to prevent duplicate or concurrent checkouts
+    SELECT room_id, status
+    INTO v_room_id, v_status
+    FROM bookings
+    WHERE booking_id = p_booking_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown booking_id: %', p_booking_id;
+    END IF;
+
+    IF v_status <> 'CHECKED_IN' THEN
+        RAISE EXCEPTION 'Booking ID % cannot be checked out (current status: %).',
+            p_booking_id, v_status;
+    END IF;
+
+    v_total := fn_stay_cost(p_booking_id);
+
+    -- Mark booking checked out and free the room
+    UPDATE bookings
+    SET status = 'CHECKED_OUT'
+    WHERE booking_id = p_booking_id;
+
+    UPDATE rooms
+    SET status = 'AVAILABLE'
+    WHERE room_id = v_room_id;
+
+    -- Issue single invoice
+    INSERT INTO invoices (booking_id, total_amount, issued_at)
+    VALUES (p_booking_id, v_total, CURRENT_TIMESTAMP);
+END;
+$$;
+
+(d) Trigger: trg_bookings_room_guard [8 marks]
+
+CREATE OR REPLACE FUNCTION fn_guard_booking_room()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_room_status VARCHAR(20);
+BEGIN
+    IF NEW.status = 'CHECKED_IN' THEN
+        SELECT status INTO v_room_status
+        FROM rooms
+        WHERE room_id = NEW.room_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Room ID % does not exist.', NEW.room_id;
+        END IF;
+
+        IF v_room_status <> 'AVAILABLE' THEN
+            RAISE EXCEPTION 'Cannot check in to room ID %: room is currently %.',
+                NEW.room_id, v_room_status;
+        END IF;
+
+        UPDATE rooms
+        SET status = 'OCCUPIED'
+        WHERE room_id = NEW.room_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_bookings_room_guard
+BEFORE INSERT ON bookings
+FOR EACH ROW
+EXECUTE FUNCTION fn_guard_booking_room();
+
+
+(e) View: v_active_stays [5 marks]
+
+CREATE OR REPLACE VIEW v_active_stays AS
+SELECT
+    r.room_number,
+    b.guest_name,
+    b.check_in,
+    b.check_out,
+    fn_stay_cost(b.booking_id) AS estimated_stay_total
+FROM bookings b
+JOIN rooms r ON r.room_id = b.room_id
+WHERE b.status = 'CHECKED_IN';
+
+-- Verify view before and after checking out Booking 3 (Mutale Banda, Room 101)
+SELECT * FROM v_active_stays;
+CALL pr_checkout_booking(3);
+SELECT * FROM v_active_stays; -- Room 101 is now removed from active stays
+
+
+(f) Index and EXPLAIN Plan [5 marks]
+
+CREATE INDEX idx_bookings_active_room_checkout
+ON bookings (room_id, check_out)
+WHERE status = 'CHECKED_IN';
+
+-- Matching query and execution plan
+EXPLAIN ANALYZE
+SELECT booking_id, room_id, guest_name, check_in, check_out
+FROM bookings
+WHERE status = 'CHECKED_IN'
+  AND room_id = 2
+  AND check_out <= CURRENT_DATE + INTERVAL '3 days';
+
+
+
+(g) Scheduled Job: pr_refresh_hotel_revenue [6 marks]
+
+
+CREATE OR REPLACE PROCEDURE pr_refresh_hotel_revenue(p_day DATE)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count   INTEGER;
+    v_revenue NUMERIC(14, 2);
+BEGIN
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(total_amount), 0.00)
+    INTO v_count, v_revenue
+    FROM invoices
+    WHERE issued_at::DATE = p_day;
+
+    INSERT INTO daily_hotel_revenue (revenue_date, checkout_count, total_revenue)
+    VALUES (p_day, v_count, v_revenue)
+    ON CONFLICT (revenue_date)
+    DO UPDATE SET
+        checkout_count = EXCLUDED.checkout_count,
+        total_revenue  = EXCLUDED.total_revenue;
+END;
+$$;
+
+-- Schedule daily at 01:30 for the previous day using pg_cron
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+SELECT cron.schedule(
+    'refresh_previous_day_hotel_revenue',
+    '30 1 * * *',
+    $$CALL pr_refresh_hotel_revenue((CURRENT_DATE - INTERVAL '1 day')::DATE);$$
+);
